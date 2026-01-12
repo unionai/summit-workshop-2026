@@ -14,7 +14,8 @@ env = flyte.TaskEnvironment(
         "wordcloud>=1.9.0",  # For wordcloud generation
         "matplotlib>=3.7.0",  # For plotting
     ),
-    resources=flyte.Resources(cpu="4", memory="4Gi")
+    resources=flyte.Resources(cpu="4", memory="4Gi"),
+    cache="auto",
 )
 
 
@@ -58,7 +59,7 @@ async def download_pdf(url: str) -> File:
 
 
 @env.task
-async def extract_text(pdf_bytes: bytes) -> dict:
+async def extract_text(pdf_file: File) -> dict:
     """
     Extract all text from a PDF file.
 
@@ -77,43 +78,42 @@ async def extract_text(pdf_bytes: bytes) -> dict:
     }
 
     # Open PDF from bytes
-    with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp:
-        tmp.write(pdf_bytes)
-        tmp_path = tmp.name
+    # Read bytes from the async file handle and open with PyMuPDF (pymupdf)
+    path = await pdf_file.download()
+    doc = pymupdf.open(path, filetype="pdf")
 
-    try:
-        doc = pymupdf.open(tmp_path)
+    # Extract document metadata
+    result["metadata"] = {
+        "title": doc.metadata.get("title", ""),
+        "author": doc.metadata.get("author", ""),
+        "subject": doc.metadata.get("subject", ""),
+        "keywords": doc.metadata.get("keywords", ""),
+        "page_count": len(doc),
+    }
 
-        # Extract document metadata
-        result["metadata"] = {
-            "title": doc.metadata.get("title", ""),
-            "author": doc.metadata.get("author", ""),
-            "subject": doc.metadata.get("subject", ""),
-            "keywords": doc.metadata.get("keywords", ""),
-            "page_count": len(doc),
-        }
+    print(f"Processing PDF with {len(doc)} pages")
 
-        print(f"Processing PDF with {len(doc)} pages")
+    all_text_parts = []
+    for page_num, page in enumerate(doc):
+        page_text = page.get_text("text")
+        result["pages"].append({
+            "page_number": page_num + 1,
+            "text": page_text,
+            "char_count": len(page_text),
+        })
+        all_text_parts.append(page_text)
 
-        all_text_parts = []
-        for page_num, page in enumerate(doc):
-            page_text = page.get_text("text")
-            result["pages"].append({
-                "page_number": page_num + 1,
-                "text": page_text,
-                "char_count": len(page_text),
-            })
-            all_text_parts.append(page_text)
-
-        result["full_text"] = "\n\n".join(all_text_parts)
-        doc.close()
-
-    finally:
-        import os
-        os.unlink(tmp_path)
+    full_text = "\n\n".join(all_text_parts)
+    full_text = full_text.replace("Property of AmericanRhetoric.com", "")
+    full_text = full_text.replace("AmericanRhetoric.com", "")
+    result["full_text"] = full_text
+    for page in result["pages"]:
+        page["text"] = page["text"].replace("AmericanRhetoric.com", "")
+    doc.close()
 
     print(f"Extracted {len(result['full_text'])} characters total")
     return result
+
 
 @env.task
 async def generate_wordcloud(text: str) -> File:
@@ -154,6 +154,7 @@ async def generate_wordcloud(text: str) -> File:
 
     # Output a Flyte File object
     return await File.from_local(local_path=tmp_filename)
+
 
 @env.task(report=True)
 async def generate_report(
@@ -428,10 +429,10 @@ async def pdf_wordcloud_pipeline(pdf_url: str) -> PipelineOutput:
     print("Starting PDF text extraction and wordcloud pipeline...")
 
     # Step 1: Download the PDF
-    pdf_bytes = await download_pdf(pdf_url)
+    pdf_file = await download_pdf(pdf_url)
 
     # Step 2: Extract text from the PDF
-    extracted_data = await extract_text(pdf_bytes)
+    extracted_data = await extract_text(pdf_file)
 
     # Step 3: Generate wordcloud from the extracted text
     wordcloud_file = await generate_wordcloud(extracted_data["full_text"])
